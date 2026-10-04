@@ -1,0 +1,198 @@
+from EventManager.Models.RunnerEvents import RunnerEvents
+from EventManager.EventSubscriptionController import EventSubscriptionController
+from ConfigValidator.Config.Models.RunTableModel import RunTableModel
+from ConfigValidator.Config.Models.FactorModel import FactorModel
+from ConfigValidator.Config.Models.RunnerContext import RunnerContext
+from ConfigValidator.Config.Models.OperationType import OperationType
+from ExtendedTyping.Typing import SupportsStr
+from ProgressManager.Output.OutputProcedure import OutputProcedure as output
+
+from typing import Dict, List, Any, Optional
+from pathlib import Path
+from os.path import dirname, realpath
+import time
+import requests
+import base64
+import subprocess
+
+class RunnerConfig:
+    ROOT_DIR = Path(dirname(realpath(__file__)))
+
+    # ================================ USER SPECIFIC CONFIG ================================
+    """The name of the experiment."""
+    name:                       str             = "new_runner_experiment_22"
+
+    """The path in which Experiment Runner will create a folder with the name `self.name`, in order to store the
+    results from this experiment. (Path does not need to exist - it will be created if necessary.)
+    Output path defaults to the config file's path, inside the folder 'experiments'"""
+    results_output_path:        Path            = ROOT_DIR / 'experiments'
+
+    """Experiment operation type. Unless you manually want to initiate each run, use `OperationType.AUTO`."""
+    operation_type:             OperationType   = OperationType.AUTO
+
+    """The time Experiment Runner will wait after a run completes.
+    This can be essential to accommodate for cooldown periods on some systems."""
+    time_between_runs_in_ms:    int             = 1000
+
+    # Dynamic configurations can be one-time satisfied here before the program takes the config as-is
+    # e.g. Setting some variable based on some criteria
+    REMOTE_LLMS = {
+            "qwen2.5-vl-3b": "http://127.0.0.1:8081/v1/chat/completions",
+            "qwen2.5-vl-7b": "http://127.0.0.1:8082/v1/chat/completions",
+            "gemma-3-4b":    "http://127.0.0.1:8083/v1/chat/completions",
+    }
+
+    NETWORK_INTERFACE = "eth0"
+
+    IMAGE_PATH = Path("/home/kali/Downloads/flower.jpeg")
+
+    NETWORK_CONDITIONS = {
+        "normal":   {"delay": None,    "rate": None},
+        "degraded": {"delay": "50ms", "rate": "20mbit"},
+        "bad": {"delay": "100ms", "rate": "5mbit"},
+    }
+
+    CONTENT_SIZES = {
+        "short":  {"max_tokens": 120,  "text_prompt": "Give a brief definition of football in a short paragraph with at least 50 words.",
+                                        "image_prompt": "Briefly describe what is shown in this image with at least 50 words."},
+        "medium": {"max_tokens": 650,  "text_prompt": "Write a paragraph about the history and rules of football since beginning up until now with at least 300 words.",
+                                        "image_prompt": "Describe this image in a few sentences, tell me everything you know about it with at least 300 words."},
+        "long":   {"max_tokens": 1350, "text_prompt": "Write a detailed essay about the evolution, rules, and cultural impact of football with at least 800 words and give examples of different teams.",
+                                        "image_prompt": "Describe this image in extensive detail, covering all visible objects, colors, composition, and setting with at least 800 words."},
+    }
+
+    CONTENT_TYPES = ["text", "image"]
+
+    REMOTE_HOST = "gl_greenbyte@glg3"
+    
+    def __init__(self):
+        """Executes immediately after program start, on config load"""
+
+        EventSubscriptionController.subscribe_to_multiple_events([
+            (RunnerEvents.BEFORE_EXPERIMENT, self.before_experiment),
+            (RunnerEvents.BEFORE_RUN       , self.before_run       ),
+            (RunnerEvents.START_RUN        , self.start_run        ),
+            (RunnerEvents.START_MEASUREMENT, self.start_measurement),
+            (RunnerEvents.INTERACT         , self.interact         ),
+            (RunnerEvents.STOP_MEASUREMENT , self.stop_measurement ),
+            (RunnerEvents.STOP_RUN         , self.stop_run         ),
+            (RunnerEvents.POPULATE_RUN_DATA, self.populate_run_data),
+            (RunnerEvents.AFTER_EXPERIMENT , self.after_experiment )
+        ])
+        self.run_table_model = None  # Initialized later
+
+        output.console_log("Custom config loaded")
+             
+    def create_run_table_model(self) -> RunTableModel:
+        factor_model   = FactorModel("model", ["qwen2.5-vl-3b", "qwen2.5-vl-7b", "gemma-3-4b"])
+        factor_type    = FactorModel("content_type", ["text", "image"])
+        factor_size    = FactorModel("content_size", ["short", "medium", "long"])
+        factor_network = FactorModel("network_condition", ["normal", "degraded", "bad"])
+
+        self.run_table_model = RunTableModel(
+            factors=[factor_model, factor_type, factor_size, factor_network],
+            exclude_combinations=[],
+            repetitions=1,
+            data_columns=['response_time_s', 'tokens_generated', 'word_count',
+                          'start_ts', 'end_ts']
+        )
+        return self.run_table_model
+
+    def before_experiment(self) -> None:
+        output.console_log("Config.before_experiment() called!")
+        output.console_log("Reminder: make sure EnergiBridge is running manually, "
+                            "both on the server and locally, before continuing.")
+
+    def before_run(self) -> None:
+        output.console_log("Config.before_run() called!")
+
+    def _set_network_condition(self, net_label: str) -> None:
+        cond = self.NETWORK_CONDITIONS[net_label]
+        subprocess.run(["sudo", "tc", "qdisc", "del", "dev", self.NETWORK_INTERFACE, "root"],
+                        stderr=subprocess.DEVNULL)
+        if cond["delay"] or cond["rate"]:
+            cmd = ["sudo", "tc", "qdisc", "add", "dev", self.NETWORK_INTERFACE, "root", "netem"]
+            if cond["delay"]:
+                cmd += ["delay", cond["delay"]]
+            if cond["rate"]:
+                cmd += ["rate", cond["rate"]]
+            subprocess.run(cmd, check=True)
+
+    def _reset_network_condition(self) -> None:
+        subprocess.run(["sudo", "tc", "qdisc", "del", "dev", self.NETWORK_INTERFACE, "root"],
+                        stderr=subprocess.DEVNULL)
+
+    def start_run(self, context: RunnerContext) -> None:
+        net_label = context.execute_run['network_condition']
+        output.console_log(f"Starting run: {context.execute_run}")
+        self._set_network_condition(net_label)
+        time.sleep(1)  # let tc settle
+
+    def start_measurement(self, context: RunnerContext) -> None:
+        pass  # EnergiBridge is started/stopped manually outside this script
+
+    def interact(self, context: RunnerContext) -> None:
+        model        = context.execute_run['model']
+        content_type = context.execute_run['content_type']
+        content_size = context.execute_run['content_size']
+
+        endpoint = self.REMOTE_LLMS[model]
+        size_cfg = self.CONTENT_SIZES[content_size]
+
+        if content_type == "text":
+            payload = {
+                "model": model,
+                "messages": [{"role": "user", "content": size_cfg["text_prompt"]}],
+                "max_tokens": size_cfg["max_tokens"],
+                "temperature": 0
+            }
+        else:
+            with open(self.IMAGE_PATH, "rb") as f:
+                b64_img = base64.b64encode(f.read()).decode("utf-8")
+            payload = {
+                "model": model,
+                "messages": [{
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": size_cfg["image_prompt"]},
+                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_img}"}}
+                    ]
+                }],
+                "max_tokens": size_cfg["max_tokens"],
+                "temperature": 0
+            }
+
+        t0 = time.time()
+        response = requests.post(endpoint, json=payload, timeout=180)
+        t1 = time.time()
+
+        self._last_response = response.json()
+        self._request_start = t0
+        self._request_end = t1
+        output.console_log(f"Request took {t1 - t0:.2f}s")
+
+    def stop_measurement(self, context: RunnerContext) -> None:
+        pass 
+
+    def stop_run(self, context: RunnerContext) -> None:
+        self._reset_network_condition()
+
+    def populate_run_data(self, context: RunnerContext) -> Optional[Dict[str, Any]]:
+        content_text = self._last_response["choices"][0]["message"]["content"]
+        word_count = len(content_text.split())
+        tokens = self._last_response.get("usage", {}).get("completion_tokens", None)
+
+        return {
+            "response_time_s": round(self._request_end - self._request_start, 3),
+            "tokens_generated": tokens,
+            "word_count": word_count,
+            "start_ts": self._request_start,
+            "end_ts": self._request_end,
+        }
+
+    def after_experiment(self) -> None:
+        self._reset_network_condition()
+        output.console_log("Experiment complete")
+
+    # ================================ DO NOT ALTER BELOW THIS LINE ================================
+    experiment_path:            Path             = None
