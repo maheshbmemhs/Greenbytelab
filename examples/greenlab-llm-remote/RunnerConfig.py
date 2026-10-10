@@ -20,7 +20,7 @@ class RunnerConfig:
 
     # ================================ USER SPECIFIC CONFIG ================================
     """The name of the experiment."""
-    name:                       str             = "new_runner_experiment_22"
+    name:                       str             = "new_runner_experiment_10"
 
     """The path in which Experiment Runner will create a folder with the name `self.name`, in order to store the
     results from this experiment. (Path does not need to exist - it will be created if necessary.)
@@ -32,7 +32,7 @@ class RunnerConfig:
 
     """The time Experiment Runner will wait after a run completes.
     This can be essential to accommodate for cooldown periods on some systems."""
-    time_between_runs_in_ms:    int             = 1000
+    time_between_runs_in_ms:    int             = 10000
 
     # Dynamic configurations can be one-time satisfied here before the program takes the config as-is
     # e.g. Setting some variable based on some criteria
@@ -64,6 +64,9 @@ class RunnerConfig:
     CONTENT_TYPES = ["text", "image"]
 
     REMOTE_HOST = "gl_greenbyte@glg3"
+    LOCAL_ENERGIBRIDGE_CMD = ["sudo", "energibridge"]
+    REMOTE_LOG_DIR         = "logs"
+    STOP_FLAG_NAME         = "local_stop_flag"
     
     def __init__(self):
         """Executes immediately after program start, on config load"""
@@ -92,16 +95,16 @@ class RunnerConfig:
         self.run_table_model = RunTableModel(
             factors=[factor_model, factor_type, factor_size, factor_network],
             exclude_combinations=[],
-            repetitions=1,
-            data_columns=['response_time_s', 'tokens_generated', 'word_count',
+            repetitions=30,
+            shuffle=True,
+            data_columns=['max_tokens', 'duration', 'tokens_generated', 'word_count', 'output_bytes', 'tokens_per_second',
                           'start_ts', 'end_ts']
         )
         return self.run_table_model
 
     def before_experiment(self) -> None:
         output.console_log("Config.before_experiment() called!")
-        output.console_log("Reminder: make sure EnergiBridge is running manually, "
-                            "both on the server and locally, before continuing.")
+        self._start_energibridge()
 
     def before_run(self) -> None:
         output.console_log("Config.before_run() called!")
@@ -126,10 +129,10 @@ class RunnerConfig:
         net_label = context.execute_run['network_condition']
         output.console_log(f"Starting run: {context.execute_run}")
         self._set_network_condition(net_label)
-        time.sleep(1)  # let tc settle
+        time.sleep(1)
 
     def start_measurement(self, context: RunnerContext) -> None:
-        pass  # EnergiBridge is started/stopped manually outside this script
+        pass # the energibridge start function added at the end
 
     def interact(self, context: RunnerContext) -> None:
         model        = context.execute_run['model']
@@ -172,7 +175,7 @@ class RunnerConfig:
         output.console_log(f"Request took {t1 - t0:.2f}s")
 
     def stop_measurement(self, context: RunnerContext) -> None:
-        pass 
+        pass # the energibridge stop function added at the end
 
     def stop_run(self, context: RunnerContext) -> None:
         self._reset_network_condition()
@@ -181,18 +184,54 @@ class RunnerConfig:
         content_text = self._last_response["choices"][0]["message"]["content"]
         word_count = len(content_text.split())
         tokens = self._last_response.get("usage", {}).get("completion_tokens", None)
+        response_time_s = round(self._request_end - self._request_start, 3)
 
         return {
-            "response_time_s": round(self._request_end - self._request_start, 3),
+            "max_tokens": self.CONTENT_SIZES[context.execute_run['content_size']]["max_tokens"],
+            "duration": response_time_s,
             "tokens_generated": tokens,
             "word_count": word_count,
+            "output_bytes": len(content_text.encode("utf-8")),
++           "tokens_per_second": round(tokens / response_time_s, 2) if tokens and response_time_s else None,
             "start_ts": self._request_start,
             "end_ts": self._request_end,
         }
 
     def after_experiment(self) -> None:
         self._reset_network_condition()
+        self._stop_energibridge_and_fetch()
         output.console_log("Experiment complete")
+
+    def _start_energibridge(self) -> None:
+        local_csv  = self.experiment_path / "local.csv"
+        local_flag = self.experiment_path / "local_stop_flag"
+        local_flag.unlink(missing_ok=True)
+        remote_csv = f"{self.REMOTE_LOG_DIR}/{self.name}_remote.csv"
+        remote_flag = f"{self.REMOTE_LOG_DIR}/{self.STOP_FLAG_NAME}"
+
+        subprocess.Popen(
+            self.LOCAL_ENERGIBRIDGE_CMD + ["--output", str(local_csv), "--",
+                "bash", "-c", f"while [ ! -f '{local_flag}' ]; do sleep 0.5; done"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+
+        remote_cmd = (
+            f"mkdir -p {self.REMOTE_LOG_DIR} && rm -f {remote_flag}; "
+            f"nohup energibridge --output {remote_csv} -- "
+            f"bash -c 'while [ ! -f {remote_flag} ]; do sleep 0.5; done' "
+            f"> /dev/null 2>&1 < /dev/null &"
+        )
+        subprocess.run(["ssh", self.REMOTE_HOST, remote_cmd], check=True)
+        time.sleep(2)
+
+    def _stop_energibridge_and_fetch(self) -> None:
+        local_flag = self.experiment_path / "local_stop_flag"
+        remote_csv = f"{self.REMOTE_LOG_DIR}/{self.name}_remote.csv"
+        remote_flag = f"{self.REMOTE_LOG_DIR}/{self.STOP_FLAG_NAME}"
+        local_flag.touch()
+        subprocess.run(["ssh", self.REMOTE_HOST, f"touch {remote_flag}"], check=True)
+        time.sleep(3)
+        subprocess.run(["scp","-O", f"{self.REMOTE_HOST}:{remote_csv}",
+                        str(self.experiment_path / "remote_energy.csv")], check=True)
 
     # ================================ DO NOT ALTER BELOW THIS LINE ================================
     experiment_path:            Path             = None
