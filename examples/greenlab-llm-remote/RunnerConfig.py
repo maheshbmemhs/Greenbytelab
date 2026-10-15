@@ -192,7 +192,7 @@ class RunnerConfig:
             "tokens_generated": tokens,
             "word_count": word_count,
             "output_bytes": len(content_text.encode("utf-8")),
-+           "tokens_per_second": round(tokens / response_time_s, 2) if tokens and response_time_s else None,
+            "tokens_per_second": round(tokens / response_time_s, 2) if tokens and response_time_s else None,
             "start_ts": self._request_start,
             "end_ts": self._request_end,
         }
